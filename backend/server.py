@@ -3,6 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from contextlib import asynccontextmanager
 import os
 import logging
 from pathlib import Path
@@ -15,7 +16,7 @@ import jwt
 import qrcode
 import io
 import base64
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+import requests
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -36,8 +37,18 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 # Security
 security = HTTPBearer()
 
-# Create the main app
-app = FastAPI()
+# Lifespan context manager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logging.info("Application starting up...")
+    yield
+    # Shutdown
+    logging.info("Application shutting down...")
+    client.close()
+
+# Create the main app with lifespan
+app = FastAPI(lifespan=lifespan)
 api_router = APIRouter(prefix="/api")
 
 # Models
@@ -211,12 +222,10 @@ def generate_qr_code(data: str) -> str:
 # Auth Routes
 @api_router.post("/auth/register", response_model=Token)
 async def register(user_data: UserRegister):
-    # Check if user exists
     existing_user = await db.users.find_one({"email": user_data.email})
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
     
-    # Create user
     user = User(
         email=user_data.email,
         name=user_data.name,
@@ -229,7 +238,6 @@ async def register(user_data: UserRegister):
     
     await db.users.insert_one(user_dict)
     
-    # Create token
     access_token = create_access_token(data={"sub": user.id})
     return Token(access_token=access_token, token_type="bearer", user=user)
 
@@ -310,7 +318,6 @@ async def create_event(event_data: EventCreate, current_user: User = Depends(get
     
     event = Event(**event_data.model_dump())
     
-    # Generate QR code for attendance
     qr_data = f"event:{event.id}"
     event.qr_code = generate_qr_code(qr_data)
     
@@ -338,7 +345,6 @@ async def rsvp_event(event_id: str, current_user: User = Depends(get_current_use
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
     
-    # Check if already RSVP'd
     existing_rsvp = await db.rsvps.find_one({"event_id": event_id, "user_id": current_user.id})
     if existing_rsvp:
         raise HTTPException(status_code=400, detail="Already RSVP'd")
@@ -367,7 +373,6 @@ async def checkin_event(event_id: str, current_user: User = Depends(get_current_
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
     
-    # Check if already checked in
     existing_attendance = await db.attendance.find_one({"event_id": event_id, "user_id": current_user.id})
     if existing_attendance:
         raise HTTPException(status_code=400, detail="Already checked in")
@@ -379,7 +384,6 @@ async def checkin_event(event_id: str, current_user: User = Depends(get_current_
     await db.attendance.insert_one(attendance_dict)
     await db.events.update_one({"id": event_id}, {"$inc": {"attendance_count": 1}})
     
-    # Check for achievements
     attendance_count = await db.attendance.count_documents({"user_id": current_user.id})
     if attendance_count == 1:
         achievement = Achievement(
@@ -466,7 +470,6 @@ async def get_transactions(club_id: str, current_user: User = Depends(get_curren
         if isinstance(transaction.get('created_at'), str):
             transaction['created_at'] = datetime.fromisoformat(transaction['created_at'])
     
-    # Calculate balance
     income = sum(t['amount'] for t in transactions if t['type'] == 'income')
     expense = sum(t['amount'] for t in transactions if t['type'] == 'expense')
     balance = income - expense
@@ -529,64 +532,74 @@ async def get_club_analytics(club_id: str, current_user: User = Depends(get_curr
 @api_router.get("/recommendations")
 async def get_recommendations(current_user: User = Depends(get_current_user)):
     try:
-        # Get user's interests and past attendance
         user_doc = await db.users.find_one({"id": current_user.id}, {"_id": 0})
-        interests = user_doc.get('interests', [])
-        
-        # Get upcoming events
+        interests = user_doc.get("interests", []) if user_doc else []
+
         now = datetime.now(timezone.utc)
         events = await db.events.find({}, {"_id": 0}).to_list(1000)
-        
-        # Filter upcoming events
+
         upcoming_events = []
         for event in events:
-            event_date = event.get('date')
+            event_date = event.get("date")
             if isinstance(event_date, str):
-                event_date = datetime.fromisoformat(event_date)
+                try:
+                    event_date = datetime.fromisoformat(event_date)
+                except ValueError:
+                    continue
             if event_date > now:
                 upcoming_events.append(event)
-        
+
         if not upcoming_events:
             return {"recommended_events": [], "message": "No upcoming events"}
-        
-        # Use Gemini to recommend events
-        gemini_api_key = os.environ.get('GEMINI_API_KEY')
-        if not gemini_api_key:
-            # Fallback to simple tag matching
-            recommended = [e for e in upcoming_events if any(tag in interests for tag in e.get('tags', []))]
-            return {"recommended_events": recommended[:5]}
-        
-        # Prepare event data for AI
+
         events_text = "\n".join([
             f"- {e['title']}: {e['description']} (Tags: {', '.join(e.get('tags', []))})"
             for e in upcoming_events
         ])
-        
+
         prompt = f"""User interests: {', '.join(interests) if interests else 'None specified'}
 
 Upcoming events:
 {events_text}
 
 Based on the user's interests, recommend the top 3-5 most relevant events. Return only the event titles, one per line, nothing else."""
-        
-        chat = LlmChat(
-            api_key=gemini_api_key,
-            session_id=f"recommendations_{current_user.id}",
-            system_message="You are an event recommendation assistant. Recommend events that match user interests."
-        ).with_model("gemini", "gemini-2.0-flash")
-        
-        message = UserMessage(text=prompt)
-        response = await chat.send_message(message)
-        
-        # Parse AI response
-        recommended_titles = [line.strip() for line in response.strip().split('\n') if line.strip()]
-        recommended_events = [e for e in upcoming_events if e['title'] in recommended_titles]
-        
+
+        gemini_api_key = os.environ.get("GEMINI_API_KEY")
+
+        if not gemini_api_key:
+            recommended = [
+                e for e in upcoming_events if any(tag in interests for tag in e.get("tags", []))
+            ]
+            return {"recommended_events": recommended[:5]}
+
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        headers = {"Content-Type": "application/json"}
+        params = {"key": gemini_api_key}
+
+        data = {
+            "contents": [
+                {"parts": [{"text": prompt}]}
+            ]
+        }
+
+        response = requests.post(url, headers=headers, params=params, json=data)
+
+        if response.status_code != 200:
+            logging.error(f"Gemini API error: {response.text}")
+            raise Exception("Gemini API request failed")
+
+        result = response.json()
+        text_response = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+        recommended_titles = [
+            line.strip() for line in text_response.split("\n") if line.strip()
+        ]
+        recommended_events = [e for e in upcoming_events if e["title"] in recommended_titles]
+
         return {"recommended_events": recommended_events[:5]}
-    
+
     except Exception as e:
         logging.error(f"Error in recommendations: {str(e)}")
-        # Fallback to simple recommendation
         return {"recommended_events": upcoming_events[:5]}
 
 # Include router
@@ -606,6 +619,4 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+# run the file using : python -m uvicorn server:app --reload
