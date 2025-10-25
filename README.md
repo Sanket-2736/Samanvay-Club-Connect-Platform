@@ -357,14 +357,6 @@ To test the application:
 - [ ] Event photo galleries
 - [ ] Social sharing features
 
-## 🤝 Contributing
-
-This is a proprietary project built for PCCOE, Pune. For feature requests or bug reports, please contact the development team.
-
-## 📄 License
-
-Copyright © 2025 PCCOE, Pune. All rights reserved.
-
 ## 👨‍💻 Built With
 
 - FastAPI - Modern Python web framework
